@@ -17,7 +17,11 @@ from lightning.pytorch.strategies.ddp import DDPStrategy
 import lightning.pytorch as pl
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities.types import TRAIN_DATALOADERS
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
+from lightning.pytorch.callbacks import (
+    LearningRateMonitor,
+    ModelCheckpoint,
+    EarlyStopping,
+)
 
 from omegaconf import DictConfig
 
@@ -107,10 +111,14 @@ class BaseLightningExperiment(BaseExperiment):
         if self.logger:
             callbacks.append(LearningRateMonitor("step", True))
 
-    def _build_training_loader(self) -> Optional[Union[TRAIN_DATALOADERS, pl.LightningDataModule]]:
+    def _build_training_loader(
+        self,
+    ) -> Optional[Union[TRAIN_DATALOADERS, pl.LightningDataModule]]:
         train_dataset = self._build_dataset("training")
         shuffle = (
-            False if isinstance(train_dataset, torch.utils.data.IterableDataset) else self.cfg.training.data.shuffle
+            False
+            if isinstance(train_dataset, torch.utils.data.IterableDataset)
+            else self.cfg.training.data.shuffle
         )
         if train_dataset:
             return torch.utils.data.DataLoader(
@@ -123,7 +131,9 @@ class BaseLightningExperiment(BaseExperiment):
         else:
             return None
 
-    def _build_validation_loader(self) -> Optional[Union[TRAIN_DATALOADERS, pl.LightningDataModule]]:
+    def _build_validation_loader(
+        self,
+    ) -> Optional[Union[TRAIN_DATALOADERS, pl.LightningDataModule]]:
         validation_dataset = self._build_dataset("validation")
         shuffle = (
             False
@@ -141,9 +151,15 @@ class BaseLightningExperiment(BaseExperiment):
         else:
             return None
 
-    def _build_test_loader(self) -> Optional[Union[TRAIN_DATALOADERS, pl.LightningDataModule]]:
+    def _build_test_loader(
+        self,
+    ) -> Optional[Union[TRAIN_DATALOADERS, pl.LightningDataModule]]:
         test_dataset = self._build_dataset("test")
-        shuffle = False if isinstance(test_dataset, torch.utils.data.IterableDataset) else self.cfg.test.data.shuffle
+        shuffle = (
+            False
+            if isinstance(test_dataset, torch.utils.data.IterableDataset)
+            else self.cfg.test.data.shuffle
+        )
         if test_dataset:
             return torch.utils.data.DataLoader(
                 test_dataset,
@@ -170,19 +186,24 @@ class BaseLightningExperiment(BaseExperiment):
             callbacks.append(LearningRateMonitor("step", True))
         if "checkpointing" in self.cfg.training:
             self.checkpoint_callback = ModelCheckpoint(
-                pathlib.Path(hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"]) / "checkpoints",
+                pathlib.Path(
+                    hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"]
+                )
+                / "checkpoints",
                 **self.cfg.training.checkpointing,
             )
             callbacks.append(self.checkpoint_callback)
         if "early_stopping" in self.cfg.training:
-            self.early_stopping_callback = EarlyStopping(**self.cfg.training.early_stopping)
+            self.early_stopping_callback = EarlyStopping(
+                **self.cfg.training.early_stopping
+            )
             callbacks.append(self.early_stopping_callback)
 
         trainer = pl.Trainer(
-            accelerator="auto",
+            # accelerator="auto",
             logger=self.logger,
             devices="auto",
-            strategy=DDPStrategy(find_unused_parameters=False) if torch.cuda.device_count() > 1 else "auto",
+            # strategy=DDPStrategy(find_unused_parameters=False) if torch.cuda.device_count() > 1 else "auto",
             callbacks=callbacks,
             gradient_clip_val=self.cfg.training.optim.gradient_clip_val,
             val_check_interval=self.cfg.validation.val_every_n_step,
@@ -224,7 +245,11 @@ class BaseLightningExperiment(BaseExperiment):
             accelerator="auto",
             logger=self.logger,
             devices="auto",
-            strategy=DDPStrategy(find_unused_parameters=False) if torch.cuda.device_count() > 1 else "auto",
+            # strategy=(
+            #     DDPStrategy(find_unused_parameters=False)
+            #     if torch.cuda.device_count() > 1
+            #     else "auto"
+            # ),
             callbacks=callbacks,
             limit_val_batches=self.cfg.validation.limit_batch,
             precision=self.cfg.validation.precision,
@@ -253,7 +278,11 @@ class BaseLightningExperiment(BaseExperiment):
             accelerator="auto",
             logger=self.logger,
             devices="auto",
-            strategy=DDPStrategy(find_unused_parameters=False) if torch.cuda.device_count() > 1 else "auto",
+            strategy=(
+                DDPStrategy(find_unused_parameters=False)
+                if torch.cuda.device_count() > 1
+                else "auto"
+            ),
             callbacks=callbacks,
             limit_test_batches=self.cfg.test.limit_batch,
             precision=self.cfg.test.precision,
@@ -265,11 +294,17 @@ class BaseLightningExperiment(BaseExperiment):
         trainer.test(
             self.algo,
             dataloaders=self._build_test_loader(),
-            ckpt_path=self.best_model_path if hasattr(self, "best_model_path") else self.ckpt_path,
+            ckpt_path=(
+                self.best_model_path
+                if hasattr(self, "best_model_path")
+                else self.ckpt_path
+            ),
         )
 
     def _build_dataset(self, split: str) -> Optional[torch.utils.data.Dataset]:
         if split in ["training", "test", "validation"]:
-            return self.compatible_datasets[self.root_cfg.dataset._name](self.root_cfg.dataset, split=split)
+            return self.compatible_datasets[self.root_cfg.dataset._name](
+                self.root_cfg.dataset, split=split
+            )
         else:
             raise NotImplementedError(f"split '{split}' is not implemented")
