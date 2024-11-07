@@ -1,0 +1,20 @@
+defaults:
+  - base_dataset
+
+env_id: "maze2d-custom-v1"
+eval_maze_name: "unblocked"
+save_dir: data/maze2d
+dataset_url: null
+gamma: 1.0
+episode_len: 600
+observation_shape: [4]
+action_dim: 2
+goal_dim: 2
+
+observation_mean: [5.3208508e+00, 7.0707588e+00, 8.1669328e-05, 3.9257415e-05]
+observation_std: [2.7286434, 3.639713, 2.4671054, 2.8468645]
+action_mean: [2.6831185e-03, 2.7905387e-05]
+action_std: [0.6864781, 0.75939524]
+# fix the reward generation part of your data pipeline, fine for now
+reward_mean: 0.0
+reward_std:  0.0

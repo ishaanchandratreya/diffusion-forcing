@@ -13,11 +13,14 @@ action_std: ${dataset.action_std}
 gamma: ${dataset.gamma}
 episode_len: ${dataset.episode_len}
 env_id: ${dataset.env_id}
+eval_maze_name: ${dataset.eval_maze_name}
+dist: ${dataset.dist}
+multi_goal: True
 # non dataset info
 x_shape: null
 frame_stack: 10
 context_frames: 1
-open_loop_horizon: 50 #fixme
+open_loop_horizon: 600 #fixme
 use_reward: False
 causal: False
 plot_start_goal: True
@@ -29,6 +32,9 @@ warmup_steps: 10000
 guidance_scale: 2.0
 chunk_size: ${dataset.episode_len}
 scheduling_matrix: pyramid
+
+visualization:
+  sampled_images: 40
 
 diffusion:
   stabilization_level: 10

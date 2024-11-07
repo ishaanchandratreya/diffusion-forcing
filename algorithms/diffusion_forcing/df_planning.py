@@ -11,8 +11,11 @@ from PIL import Image
 from .df_base import DiffusionForcingBase
 from utils.logging_utils import (
     make_trajectory_images,
-    get_random_start_goal,
+    get_random_start_env_goal,
+    get_random_start_random_goal,
 )
+
+from utils.maze_utils import maze_name_to_maze_spec
 
 
 class DiffusionForcingPlanning(DiffusionForcingBase):
@@ -21,7 +24,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.action_dim = len(cfg.action_mean)
         self.observation_dim = len(cfg.observation_mean)
         self.use_reward = cfg.use_reward
-        self.unstacked_dim = self.observation_dim + self.action_dim + int(self.use_reward)
+        self.unstacked_dim = (
+            self.observation_dim + self.action_dim + int(self.use_reward)
+        )
         cfg.x_shape = (self.unstacked_dim,)
         self.episode_len = cfg.episode_len
         self.n_tokens = self.episode_len // cfg.frame_stack + 1
@@ -55,18 +60,30 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         actions = actions[..., : self.action_dim]
 
         if (n_frames - 1) % self.frame_stack != 0:
-            raise ValueError("Number of frames - 1 must be divisible by frame stack size")
+            raise ValueError(
+                "Number of frames - 1 must be divisible by frame stack size"
+            )
 
-        nonterminals = torch.cat([torch.ones_like(nonterminals[:, : self.frame_stack]), nonterminals[:, :-1]], dim=1)
+        nonterminals = torch.cat(
+            [
+                torch.ones_like(nonterminals[:, : self.frame_stack]),
+                nonterminals[:, :-1],
+            ],
+            dim=1,
+        )
         nonterminals = nonterminals.bool().permute(1, 0)
         masks = torch.cumprod(nonterminals, dim=0).contiguous()
 
         rewards = rewards[:, :-1, None]
         actions = actions[:, :-1]
         init_obs, observations = torch.split(observations, [1, n_frames - 1], dim=1)
-        bundles = self._normalize_x(self.make_bundle(observations, actions, rewards))  # (b t c)
+        bundles = self._normalize_x(
+            self.make_bundle(observations, actions, rewards)
+        )  # (b t c)
         init_bundle = self._normalize_x(self.make_bundle(init_obs[:, 0]))  # (b c)
-        init_bundle[:, self.observation_dim :] = 0  # zero out actions and rewards after normalization
+        init_bundle[:, self.observation_dim :] = (
+            0  # zero out actions and rewards after normalization
+        )
         init_bundle = self.pad_init(init_bundle, batch_first=True)  # (b t c)
         bundles = torch.cat([init_bundle, bundles], dim=1)
         bundles = rearrange(bundles, "b (t fs) ... -> t b fs ...", fs=self.frame_stack)
@@ -86,19 +103,29 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         weights = masks.float()
         if not self.causal:
             # manually mask out entries to train for varying length
-            random_terminal = torch.randint(2, n_tokens + 1, (batch_size,), device=self.device)
-            random_terminal = nn.functional.one_hot(random_terminal, n_tokens + 1)[:, :n_tokens].bool()
-            random_terminal = repeat(random_terminal, "b t -> (t fs) b", fs=self.frame_stack)
+            random_terminal = torch.randint(
+                2, n_tokens + 1, (batch_size,), device=self.device
+            )
+            random_terminal = nn.functional.one_hot(random_terminal, n_tokens + 1)[
+                :, :n_tokens
+            ].bool()
+            random_terminal = repeat(
+                random_terminal, "b t -> (t fs) b", fs=self.frame_stack
+            )
             nonterminal_causal = torch.cumprod(~random_terminal, dim=0)
             weights *= torch.clip(nonterminal_causal.float(), min=0.05)
             masks *= nonterminal_causal.bool()
 
-        xs_pred, loss = self.diffusion_model(xs, conditions, noise_levels=self._generate_noise_levels(xs, masks=masks))
+        xs_pred, loss = self.diffusion_model(
+            xs, conditions, noise_levels=self._generate_noise_levels(xs, masks=masks)
+        )
 
         loss = self.reweight_loss(loss, weights)
 
         if batch_idx % 100 == 0:
-            self.log("training/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
+            self.log(
+                "training/loss", loss, on_step=True, on_epoch=False, sync_dist=True
+            )
 
         xs = self._unstack_and_unnormalize(xs)[self.frame_stack - 1 :]
         xs_pred = self._unstack_and_unnormalize(xs_pred)[self.frame_stack - 1 :]
@@ -106,8 +133,18 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         # Visualization, including masked out entries
         if self.global_step % 10000 == 0:
             o, a, r = self.split_bundle(xs_pred)
-            trajectory = o.detach().cpu().numpy()[:-1, :8]  # last observation is dummy, sample 8
-            images = make_trajectory_images(self.env_id, trajectory, trajectory.shape[1], None, None, False)
+            trajectory = (
+                o.detach().cpu().numpy()[:-1, :8]
+            )  # last observation is dummy, sample 8
+            images = make_trajectory_images(
+                self.env_id,
+                trajectory,
+                trajectory.shape[1],
+                None,
+                None,
+                False,
+                eval_maze_name=self.cfg.eval_maze_name,
+            )
             for i, img in enumerate(images):
                 self.log_image(
                     f"training_visualization/sample_{i}",
@@ -129,13 +166,45 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if self.guidance_scale == 0:
             namespace += "_no_guidance_random_walk"
         horizon = self.episode_len
-        if self.action_dim != 2:
-            self.eval_planning(
-                batch_size, conditions, horizon, namespace + str(horizon)
-            )  # can run planning without environment installation
-        self.interact(batch_size, conditions, namespace)  # interact if environment is installation
 
-    def plan(self, start: torch.Tensor, goal: torch.Tensor, horizon: int, conditions: Optional[Any] = None):
+        all_starts, all_goals, all_images_interaction, all_images_interaction_plan = (
+            self.interact(batch_size, conditions, namespace)
+        )  # interact if environment is installation
+
+        if self.action_dim != 2:
+            all_images_planning = self.eval_planning(
+                batch_size,
+                conditions,
+                horizon,
+                namespace + str(horizon),
+                all_starts,
+                all_goals,
+            )  # can run planning without environment installation
+
+            for i, (img_plan, img_int) in enumerate(
+                zip(all_images_interaction_plan, all_images_interaction)
+            ):
+                # concatenate planning and interaction images
+                img = np.concatenate([img_plan, img_int], axis=1)
+                self.log_image(
+                    f"{namespace}_plan_int/sample_{i}",
+                    Image.fromarray(img),
+                )
+
+        else:
+            for i, img in enumerate(all_images_interaction):
+                self.log_image(
+                    f"{namespace}_interaction/sample_{i}",
+                    Image.fromarray(img),
+                )
+
+    def plan(
+        self,
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        horizon: int,
+        conditions: Optional[Any] = None,
+    ):
         # start and goal are numpy arrays of shape (b, obs_dim)
         # start and goal are assumed to be normalized
         # returns plan history of (m, t, b, c), where the last dim of m is the fully diffused plan
@@ -148,28 +217,44 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         def goal_guidance(x):
             # x is a tensor of shape [t b (fs c)]
             pred = rearrange(x, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
-            h_padded = pred.shape[0] - self.frame_stack  # include padding when horizon % frame_stack != 0
+            h_padded = (
+                pred.shape[0] - self.frame_stack
+            )  # include padding when horizon % frame_stack != 0
 
             if not self.use_reward:
                 # sparse / no reward setting, guide with goal like diffuser
                 target = torch.stack([start] * self.frame_stack + [goal] * (h_padded))
-                dist = nn.functional.mse_loss(pred, target, reduction="none")  # (t fs) b c
+                dist = nn.functional.mse_loss(
+                    pred, target, reduction="none"
+                )  # (t fs) b c
 
                 # guidance weight for observation and action
                 weight = np.array(
-                    [20] * (self.frame_stack)  # conditoning (aka reconstruction guidance)
-                    + [1 for _ in range(horizon)]  # try to reach the goal at any horizon
-                    + [0] * (h_padded - horizon)  # don't guide padded entries due to horizon % frame_stack != 0
+                    [20]
+                    * (self.frame_stack)  # conditoning (aka reconstruction guidance)
+                    + [
+                        1 for _ in range(horizon)
+                    ]  # try to reach the goal at any horizon
+                    + [0]
+                    * (
+                        h_padded - horizon
+                    )  # don't guide padded entries due to horizon % frame_stack != 0
                 )
                 # mathematically, one may also try multiplying weight by sqrt(alpha_cum)
                 # this means you put higher weight to less noisy terms
                 # which might be better but we haven't tried yet
                 weight = torch.from_numpy(weight).float().to(self.device)
-                
-                dist_o, dist_a, _ = self.split_bundle(dist)  # guidance observation and action with separate weights
+
+                dist_o, dist_a, _ = self.split_bundle(
+                    dist
+                )  # guidance observation and action with separate weights
                 dist_a = torch.sum(dist_a, -1, keepdim=True).sqrt()
-                dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=self.observation_dim // 2).sqrt()
-                dist_o = torch.tanh(dist_o / 2)  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
+                dist_o = reduce(
+                    dist_o, "t b (n c) -> t b n", "sum", n=self.observation_dim // 2
+                ).sqrt()
+                dist_o = torch.tanh(
+                    dist_o / 2
+                )  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
                 dist = torch.cat([dist_o, dist_a], -1)
                 weight = repeat(weight, "t -> t c", c=dist.shape[-1])
                 weight[self.frame_stack :, 1:] = 8
@@ -179,9 +264,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 episode_return = -(dist * weight).mean() * 1000
             else:
                 # dense reward seeting, guide with reward
-                raise NotImplementedError("reward guidance not officially supported yet, although implemented")
+                raise NotImplementedError(
+                    "reward guidance not officially supported yet, although implemented"
+                )
                 rewards = pred[:, :, -1]
-                weight = np.array([10] * self.frame_stack + [0.997**j for j in range(h)] + [0] * h_padded)
+                weight = np.array(
+                    [10] * self.frame_stack
+                    + [0.997**j for j in range(h)]
+                    + [0] * h_padded
+                )
                 weight = torch.from_numpy(weight).float().to(self.device)
                 episode_return = rewards * weight[:, None]
 
@@ -192,9 +283,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         plan_tokens = np.ceil(horizon / self.frame_stack).astype(int)
         pad_tokens = 0 if self.causal else self.n_tokens - plan_tokens - 1
         scheduling_matrix = self._generate_scheduling_matrix(plan_tokens)
-        chunk = torch.randn((plan_tokens, batch_size, *self.x_stacked_shape), device=self.device)
-        chunk = torch.clamp(chunk, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise)
-        pad = torch.zeros((pad_tokens, batch_size, *self.x_stacked_shape), device=self.device)
+        chunk = torch.randn(
+            (plan_tokens, batch_size, *self.x_stacked_shape), device=self.device
+        )
+        chunk = torch.clamp(
+            chunk, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise
+        )
+        pad = torch.zeros(
+            (pad_tokens, batch_size, *self.x_stacked_shape), device=self.device
+        )
         init_token = rearrange(self.pad_init(start), "fs b c -> 1 b (fs c)")
         plan = torch.cat([init_token, chunk, pad], 0)
 
@@ -220,28 +317,57 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             from_noise_levels = repeat(from_noise_levels, "t -> t b", b=batch_size)
             to_noise_levels = repeat(to_noise_levels, "t -> t b", b=batch_size)
             plan[1 : self.n_tokens - pad_tokens] = self.diffusion_model.sample_step(
-                plan, conditions, from_noise_levels, to_noise_levels, guidance_fn=guidance_fn
+                plan,
+                conditions,
+                from_noise_levels,
+                to_noise_levels,
+                guidance_fn=guidance_fn,
             )[1 : self.n_tokens - pad_tokens]
             plan_hist.append(plan.detach()[: self.n_tokens - pad_tokens])
 
         plan_hist = torch.stack(plan_hist)
-        plan_hist = rearrange(plan_hist, "m t b (fs c) -> m (t fs) b c", fs=self.frame_stack)
+        plan_hist = rearrange(
+            plan_hist, "m t b (fs c) -> m (t fs) b c", fs=self.frame_stack
+        )
         plan_hist = plan_hist[:, self.frame_stack : self.frame_stack + horizon]
 
         return plan_hist
 
-    def eval_planning(self, batch_size: int, conditions=None, horizon=None, namespace="validation"):
-        start, goal = get_random_start_goal(self.env_id, batch_size)
+    def eval_planning(
+        self,
+        batch_size: int,
+        conditions=None,
+        horizon=None,
+        namespace="validation",
+        all_starts=None,
+        all_goals=None,
+    ):
+
+        if all_starts is not None and all_goals is not None:
+            start, goal = all_starts[0][:, : self.observation_dim], all_goals[0]
+        else:
+            if self.cfg.multi_goal:
+                start, goal = get_random_start_random_goal(self.env_id, batch_size)
+            else:
+                start, goal = get_random_start_env_goal(self.env_id, batch_size)
 
         start_normalized = torch.from_numpy(start).float().to(self.device)
-        start_normalized = torch.cat([start_normalized, torch.zeros_like(start_normalized)], -1)
+        start_normalized = torch.cat(
+            [start_normalized, torch.zeros_like(start_normalized)], -1
+        )
         start_normalized = start_normalized[:, : self.observation_dim]
-        start_normalized = self.split_bundle(self._normalize_x(self.make_bundle(start_normalized)))[0]
+        start_normalized = self.split_bundle(
+            self._normalize_x(self.make_bundle(start_normalized))
+        )[0]
 
         goal_normalized = torch.from_numpy(goal).float().to(self.device)
-        goal_normalized = torch.cat([goal_normalized, torch.zeros_like(goal_normalized)], -1)
+        goal_normalized = torch.cat(
+            [goal_normalized, torch.zeros_like(goal_normalized)], -1
+        )
         goal_normalized = goal_normalized[:, : self.observation_dim]
-        goal_normalized = self.split_bundle(self._normalize_x(self.make_bundle(goal_normalized)))[0]
+        goal_normalized = self.split_bundle(
+            self._normalize_x(self.make_bundle(goal_normalized))
+        )[0]
 
         horizon = self.episode_len if horizon is None else horizon
         plan_hist = self.plan(start_normalized, goal_normalized, horizon, conditions)
@@ -250,21 +376,74 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # Visualization
         o, _, _ = self.split_bundle(plan)
-        o = o.detach().cpu().numpy()[:-1, :16]  # last observation is dummy
-        images = make_trajectory_images(self.env_id, o, o.shape[1], start, goal, self.plot_end_points)
-        for i, img in enumerate(images):
-            self.log_image(
-                f"{namespace}_plan/sample_{i}",
-                Image.fromarray(img),
-            )
+        o = (
+            o.detach().cpu().numpy()[:-1, : self.cfg.visualization.sampled_images]
+        )  # last observation is dummy
+        images = make_trajectory_images(
+            self.env_id,
+            o,
+            o.shape[1],
+            start,
+            goal,
+            self.plot_end_points,
+            eval_maze_name=self.cfg.eval_maze_name,
+        )
+        # for i, img in enumerate(images):
+        #     self.log_image(
+        #         f"{namespace}_plan/sample_{i}",
+        #         Image.fromarray(img),
+        #     )
+
+        return images
 
     def interact(self, batch_size: int, conditions=None, namespace="validation"):
+
+        all_starts = []
+        all_goals = []
         try:
             import d4rl
             import gym
+            from gym.envs.registration import register
             from stable_baselines3.common.vec_env import DummyVecEnv
+
+            if self.env_id not in gym.envs.registry.env_specs:
+
+                assert self.env_id == "maze2d-custom-v1"
+                max_episode_steps = 600
+                maze_spec = maze_name_to_maze_spec(
+                    self.env_id, eval_maze_name=self.cfg.eval_maze_name
+                )
+
+                # maze_spec = (
+                #     "###############\\"
+                #     + "#OOOOOOOOOOOOO#\\"
+                #     + "#OOOOOOOOOO#OO#\\"
+                #     + "#O####OOOOO#GO#\\"
+                #     + "#O#OO#OOOOO#OO#\\"
+                #     + "#O#OO#OOOOO#OO#\\"
+                #     + "#OOOOOO###OOOO#\\"
+                #     + "#OOOOOO###OOOO#\\"
+                #     + "#OOOOOO###OOOO#\\"
+                #     + "#O##########OO#\\"
+                #     + "#OOOOOOOOOOOOO#\\"
+                #     + "###############"
+                # )
+                register(
+                    id=self.env_id,
+                    entry_point=(
+                        "d4rl.pointmaze:MazeEnvWithDist"
+                        if self.cfg.dist
+                        else "d4rl.pointmaze:MazeEnv"
+                    ),
+                    max_episode_steps=max_episode_steps,
+                    kwargs=dict(
+                        maze_spec=maze_spec, reward_type="sparse", reset_target=False
+                    ),
+                )
         except ImportError:
-            print("d4rl import not successful, skipping environment interaction. Check d4rl installation.")
+            print(
+                "d4rl import not successful, skipping environment interaction. Check d4rl installation."
+            )
             return
 
         print("Interacting with environment... This may take a couple minutes.")
@@ -272,9 +451,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         use_diffused_action = False
         if self.action_dim != 2:
             # https://arxiv.org/abs/2205.09991
-            print("Detected reduced observation/action space, using Diffuser like controller.")
+            print(
+                "Detected reduced observation/action space, using Diffuser like controller."
+            )
         else:
-            print("Detected full observation/action space, using MPC controller w/ diffused actions.")
+            print(
+                "Detected full observation/action space, using MPC controller w/ diffused actions."
+            )
             use_diffused_action = True
 
         envs = DummyVecEnv([lambda: gym.make(self.env_id)] * batch_size)
@@ -284,12 +467,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         obs_mean = self.data_mean[: self.observation_dim]
         obs_std = self.data_std[: self.observation_dim]
         obs = envs.reset()
+        all_starts.append(np.copy(obs))
 
         obs = torch.from_numpy(obs).float().to(self.device)
         start = obs.detach()
-        obs_normalized = ((obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]).detach()
+        obs_normalized = (
+            (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
+        ).detach()
 
-        goal = np.concatenate(envs.get_attr("goal_locations"))
+        if self.cfg.multi_goal:
+            _, goal = get_random_start_random_goal(self.env_id, batch_size)
+        else:
+            _, goal = np.concatenate(envs.get_attr("goal_locations"))
+
+        all_goals.append(np.copy(goal))
         goal = torch.Tensor(goal).float().to(self.device)
         goal = torch.cat([goal, torch.zeros_like(goal)], -1)
         goal = goal[:, : self.observation_dim]
@@ -302,11 +493,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         first_reach = np.zeros(batch_size)
 
         trajectory = []  # actual trajectory
-        all_plan_hist = []  # a list of plan histories, each history is a collection of m diffusion steps
+        all_plan_hist = (
+            []
+        )  # a list of plan histories, each history is a collection of m diffusion steps
 
         # run mpc with diffused actions
         while not terminate and steps < self.episode_len:
-            plan_hist = self.plan(obs_normalized, goal_normalized, self.episode_len - steps, conditions)
+            plan_hist = self.plan(
+                obs_normalized, goal_normalized, self.episode_len - steps, conditions
+            )
             plan_hist = self._unnormalize_x(plan_hist)  # (m t b c)
             plan = plan_hist[-1]  # (t b c)
 
@@ -316,8 +511,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 if use_diffused_action:
                     _, action, _ = self.split_bundle(plan[t])
                 else:
-                    plan_vel = plan[t, :, :2] - plan[t - 1, :, :2] if t > 0 else plan[t, :, :2] - obs[:, :2]
-                    action = 12.5 * (plan[t, :, :2] - obs[:, :2]) + 1.2 * (plan_vel - obs[:, 2:])
+                    plan_vel = (
+                        plan[t, :, :2] - plan[t - 1, :, :2]
+                        if t > 0
+                        else plan[t, :, :2] - obs[:, :2]
+                    )
+                    action = 12.5 * (plan[t, :, :2] - obs[:, :2]) + 1.2 * (
+                        plan_vel - obs[:, 2:]
+                    )
                 action = torch.clip(action, -1, 1).detach().cpu()
                 obs, reward, done, _ = envs.step(np.nan_to_num(action.numpy()))
 
@@ -330,11 +531,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     terminate = True
                     break
 
-                obs, reward, done = [torch.from_numpy(item).float() for item in [obs, reward, done]]
+                obs, reward, done = [
+                    torch.from_numpy(item).float() for item in [obs, reward, done]
+                ]
                 bundle = self.make_bundle(obs, action, reward[..., None])
                 trajectory.append(bundle)
                 obs = obs.to(self.device)
-                obs_normalized = ((obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]).detach()
+                obs_normalized = (
+                    (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
+                ).detach()
 
                 steps += 1
 
@@ -343,17 +548,40 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.log(f"{namespace}/first_reach", first_reach.mean())
 
         # Visualization
-        samples = min(16, batch_size)
+        samples = min(self.cfg.visualization.sampled_images, batch_size)
         trajectory = torch.stack(trajectory)
         start = start[:, :2].cpu().numpy().tolist()
         goal = goal[:, :2].cpu().numpy().tolist()
-        images = make_trajectory_images(self.env_id, trajectory, samples, start, goal, self.plot_end_points)
+        images = make_trajectory_images(
+            self.env_id,
+            trajectory,
+            samples,
+            start,
+            goal,
+            self.plot_end_points,
+            eval_maze_name=self.cfg.eval_maze_name,
+        )
 
-        for i, img in enumerate(images):
-            self.log_image(
-                f"{namespace}_interaction/sample_{i}",
-                Image.fromarray(img),
-            )
+        plot_all_plan_hist = [
+            plan_hist[-1][: self.open_loop_horizon] for plan_hist in all_plan_hist
+        ]
+        plot_all_plan_hist = np.concatenate(plot_all_plan_hist, axis=0)
+        images_plan = make_trajectory_images(
+            self.env_id,
+            plot_all_plan_hist,
+            samples,
+            start,
+            goal,
+            self.plot_end_points,
+            eval_maze_name=self.cfg.eval_maze_name,
+        )
+        # for i, img in enumerate(images):
+        #     self.log_image(
+        #         f"{namespace}_interaction/sample_{i}",
+        #         Image.fromarray(img),
+        #     )
+
+        return all_starts, all_goals, images, images_plan
 
     def pad_init(self, x, batch_first=False):
         x = repeat(x, "b ... -> fs b ...", fs=self.frame_stack).clone()
@@ -403,12 +631,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         return torch.cat(bundle, -1)
 
-    def _generate_noise_levels(self, xs: torch.Tensor, masks: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _generate_noise_levels(
+        self, xs: torch.Tensor, masks: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         noise_levels = super()._generate_noise_levels(xs, masks)
         _, batch_size, *_ = xs.shape
 
         # first frame is almost always known, this reflect that
         if random() < 0.5:
-            noise_levels[0] = torch.randint(0, self.timesteps // 4, (batch_size,), device=xs.device)
+            noise_levels[0] = torch.randint(
+                0, self.timesteps // 4, (batch_size,), device=xs.device
+            )
 
         return noise_levels
